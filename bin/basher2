@@ -1,0 +1,717 @@
+#!/bin/sh
+# basher2 — A secure, POSIX-compatible shell package manager
+#
+# Summary: A package manager for shell scripts
+# Usage: basher2 <command> [<args>]
+
+# Resolve absolute path of this script for file-based operations (help, completions)
+BASHER2_SELF="$0"
+case "$BASHER2_SELF" in
+	*/*) ;;
+	*) BASHER2_SELF="$(command -v "$BASHER2_SELF" 2>/dev/null)" || BASHER2_SELF="$0" ;;
+esac
+case "$BASHER2_SELF" in
+	/*) ;;
+	*) BASHER2_SELF="$(cd "$(dirname "$BASHER2_SELF")" && pwd)/$(basename "$BASHER2_SELF")" ;;
+esac
+BASHER2_ROOT="$(dirname "$(dirname "$BASHER2_SELF")")"
+
+# ============================================================
+# Environment
+# ============================================================
+
+if [ -z "$BASHER_ROOT" ]; then
+	BASHER_ROOT="$HOME/.basher"
+	if [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/basher" ]; then
+		BASHER_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/basher"
+	fi
+fi
+export BASHER_ROOT
+
+if [ -z "$BASHER_PREFIX" ]; then
+	BASHER_PREFIX="$BASHER_ROOT/cellar"
+fi
+export BASHER_PREFIX
+
+if [ -z "$BASHER_PACKAGES_PATH" ]; then
+	BASHER_PACKAGES_PATH="$BASHER_PREFIX/packages"
+fi
+export BASHER_PACKAGES_PATH
+
+if [ -z "$BASHER_INSTALL_BIN" ]; then
+	BASHER_INSTALL_BIN="$BASHER_PREFIX/bin"
+fi
+export BASHER_INSTALL_BIN
+
+if [ -z "$BASHER_INSTALL_MAN" ]; then
+	BASHER_INSTALL_MAN="$BASHER_PREFIX/man"
+fi
+export BASHER_INSTALL_MAN
+
+# ============================================================
+# POSIX utilities
+# ============================================================
+
+# Safe extraction and eval of variables from package.sh (approach from PR #135).
+# grep's whitelist prevents any shell metacharacter from reaching eval,
+# making the eval injection-safe.
+get_vars_from_file() {
+	local names_pattern="$1"; shift
+	local content_pattern='[a-zA-Z0-9.:/_-]*'
+	local value_pattern
+	value_pattern="($content_pattern|'$content_pattern'|\"$content_pattern\")"
+	eval "$(grep -E "^${names_pattern}=${value_pattern}$" "$@" || true)"
+}
+
+# POSIX realpath equivalent
+resolve_path() {
+	if command -v realpath >/dev/null 2>&1; then
+		realpath "$1"
+	else
+		readlink -f "$1"
+	fi
+}
+
+# Returns 0 if a package name component (namespace or name) is valid.
+# Only allows [a-zA-Z0-9._-].
+validate_pkg_component() {
+	case "${1:-}" in
+		''|*[!a-zA-Z0-9._-]*) return 1 ;;
+	esac
+}
+
+# Extracts the manpage section number from a filename.
+# "foo.3" → prints "3" and returns 0; non-manpage → returns 1.
+manpage_section() {
+	case "$1" in
+		*.[1-9]) printf '%s' "${1##*.}"; return 0 ;;
+	esac
+	return 1
+}
+
+# ============================================================
+# Internal functions
+# ============================================================
+
+_clone() {
+	local use_ssh="$1" site="$2" package="$3" ref="$4" folder="$5"; shift 5
+	local user="${package%%/*}" name="${package#*/}"
+
+	if ! validate_pkg_component "$user" || ! validate_pkg_component "$name"; then
+		echo >&2 "basher2: invalid package name '$package'"
+		return 1
+	fi
+
+	[ -n "$folder" ] || folder="$package"
+
+	if [ -e "$BASHER_PACKAGES_PATH/$folder" ]; then
+		echo "Folder '$folder' already exists"
+		return 0
+	fi
+
+	set --
+	if [ "${BASHER_FULL_CLONE:-}" != "true" ]; then
+		set -- "$@" --depth=1
+	fi
+	if [ -n "$ref" ]; then
+		set -- "$@" -b "$ref"
+	fi
+	set -- "$@" --recursive
+	if [ "$use_ssh" = "true" ]; then
+		set -- "$@" "git@${site}:${package}.git"
+	else
+		set -- "$@" "https://${site}/${package}.git"
+	fi
+	git clone "$@" "${BASHER_PACKAGES_PATH}/$folder"
+}
+
+_deps() {
+	local package="$1"; shift
+	local pkg_sh="$BASHER_PACKAGES_PATH/$package/package.sh"
+
+	[ -f "$pkg_sh" ] || return 0
+	local DEPS=""
+	get_vars_from_file 'DEPS' "$pkg_sh"
+	[ -n "$DEPS" ] || return 0
+
+	local IFS=: dep
+	for dep in $DEPS; do
+		[ -n "$dep" ] || continue
+		basher2_install "$dep"
+	done
+}
+
+_link_bins() {
+	local package="$1"; shift
+	local pkg_dir="$BASHER_PACKAGES_PATH/$package"
+	local pkg_sh="$pkg_dir/package.sh"
+	local BINS="" REMOVE_EXTENSION="false"
+
+	[ -f "$pkg_sh" ] && get_vars_from_file 'BINS|REMOVE_EXTENSION' "$pkg_sh"
+
+	mkdir -p "$BASHER_INSTALL_BIN"
+
+	local bin name
+	if [ -n "$BINS" ]; then
+		local IFS=:
+		for bin in $BINS; do
+			[ -n "$bin" ] || continue
+			name="${bin##*/}"
+			[ "$REMOVE_EXTENSION" = "true" ] && name="${name%%.*}"
+			ln -sf "$pkg_dir/$bin" "$BASHER_INSTALL_BIN/$name"
+			chmod +x "$BASHER_INSTALL_BIN/$name"
+		done
+		return 0
+	fi
+
+	if [ -d "$pkg_dir/bin" ]; then
+		for bin in "$pkg_dir/bin/"*; do
+			[ -e "$bin" ] || continue
+			name="${bin##*/}"
+			[ "$REMOVE_EXTENSION" = "true" ] && name="${name%%.*}"
+			ln -sf "$bin" "$BASHER_INSTALL_BIN/$name"
+			chmod +x "$BASHER_INSTALL_BIN/$name"
+		done
+	else
+		find "$pkg_dir" -maxdepth 1 -mindepth 1 \( -perm -u+x -type f -o -type l \) |
+		while IFS= read -r bin; do
+			name="${bin##*/}"
+			[ "$REMOVE_EXTENSION" = "true" ] && name="${name%%.*}"
+			ln -sf "$bin" "$BASHER_INSTALL_BIN/$name"
+			chmod +x "$BASHER_INSTALL_BIN/$name"
+		done
+	fi
+}
+
+_unlink_bins() {
+	local package="$1"; shift
+	local pkg_dir="$BASHER_PACKAGES_PATH/$package"
+	local pkg_sh="$pkg_dir/package.sh"
+	local BINS="" REMOVE_EXTENSION="false"
+
+	[ -f "$pkg_sh" ] && get_vars_from_file 'BINS|REMOVE_EXTENSION' "$pkg_sh"
+
+	local bin name
+	if [ -n "$BINS" ]; then
+		local IFS=:
+		for bin in $BINS; do
+			[ -n "$bin" ] || continue
+			name="${bin##*/}"
+			[ "$REMOVE_EXTENSION" = "true" ] && name="${name%%.*}"
+			rm -f -- "$BASHER_INSTALL_BIN/$name"
+		done
+		return 0
+	fi
+
+	if [ -d "$pkg_dir/bin" ]; then
+		for bin in "$pkg_dir/bin/"*; do
+			[ -e "$bin" ] || continue
+			name="${bin##*/}"
+			[ "$REMOVE_EXTENSION" = "true" ] && name="${name%%.*}"
+			rm -f -- "$BASHER_INSTALL_BIN/$name"
+		done
+	else
+		find "$pkg_dir" -maxdepth 1 -mindepth 1 \( -perm -u+x -type f -o -type l \) |
+		while IFS= read -r bin; do
+			name="${bin##*/}"
+			[ "$REMOVE_EXTENSION" = "true" ] && name="${name%%.*}"
+			rm -f -- "$BASHER_INSTALL_BIN/$name"
+		done
+	fi
+}
+
+_link_man() {
+	local package="$1"; shift
+	local pkg_dir="$BASHER_PACKAGES_PATH/$package"
+
+	[ -d "$pkg_dir/man" ] || return 0
+
+	local file n
+	for file in "$pkg_dir/man/"*; do
+		[ -e "$file" ] || continue
+		n="$(manpage_section "${file##*/}")" || continue
+		mkdir -p "$BASHER_INSTALL_MAN/man${n}"
+		ln -sf "$file" "$BASHER_INSTALL_MAN/man${n}/${file##*/}"
+	done
+}
+
+_unlink_man() {
+	local package="$1"; shift
+	local pkg_dir="$BASHER_PACKAGES_PATH/$package"
+
+	[ -d "$pkg_dir/man" ] || return 0
+
+	local file n
+	for file in "$pkg_dir/man/"*; do
+		[ -e "$file" ] || continue
+		n="$(manpage_section "${file##*/}")" || continue
+		rm -f -- "$BASHER_INSTALL_MAN/man${n}/${file##*/}"
+	done
+}
+
+_link_completions() {
+	local package="$1"; shift
+	local pkg_dir="$BASHER_PACKAGES_PATH/$package"
+	local pkg_sh="$pkg_dir/package.sh"
+	local BASH_COMPLETIONS=""
+
+	[ -f "$pkg_sh" ] || return 0
+	get_vars_from_file 'BASH_COMPLETIONS' "$pkg_sh"
+	[ -n "$BASH_COMPLETIONS" ] || return 0
+
+	mkdir -p "$BASHER_PREFIX/completions/bash"
+	local IFS=: completion
+	for completion in $BASH_COMPLETIONS; do
+		[ -n "$completion" ] || continue
+		ln -sf "$pkg_dir/$completion" "$BASHER_PREFIX/completions/bash/${completion##*/}"
+	done
+}
+
+_unlink_completions() {
+	local package="$1"; shift
+	local pkg_dir="$BASHER_PACKAGES_PATH/$package"
+	local pkg_sh="$pkg_dir/package.sh"
+	local BASH_COMPLETIONS=""
+
+	[ -f "$pkg_sh" ] || return 0
+	get_vars_from_file 'BASH_COMPLETIONS' "$pkg_sh"
+	[ -n "$BASH_COMPLETIONS" ] || return 0
+
+	local IFS=: completion
+	for completion in $BASH_COMPLETIONS; do
+		[ -n "$completion" ] || continue
+		rm -f -- "$BASHER_PREFIX/completions/bash/${completion##*/}"
+	done
+}
+
+_link() {
+	local package="$1"; shift
+	_link_bins "$package"
+	_link_completions "$package"
+	_link_man "$package"
+}
+
+_unlink() {
+	local package="$1"; shift
+	_unlink_man "$package"
+	_unlink_bins "$package"
+	_unlink_completions "$package"
+}
+
+# Prints bin names for a package (used by basher2_list -v)
+_list_bins() {
+	local package="$1"; shift
+	local pkg_dir="$BASHER_PACKAGES_PATH/$package"
+	local pkg_sh="$pkg_dir/package.sh"
+	local BINS="" REMOVE_EXTENSION="false"
+
+	[ -f "$pkg_sh" ] && get_vars_from_file 'BINS|REMOVE_EXTENSION' "$pkg_sh"
+
+	if [ -n "$BINS" ]; then
+		local bin name IFS=:
+		for bin in $BINS; do
+			[ -n "$bin" ] || continue
+			name="${bin##*/}"
+			[ "$REMOVE_EXTENSION" = "true" ] && name="${name%%.*}"
+			echo "- $name"
+		done
+		return 0
+	fi
+
+	local bin name
+	if [ -d "$pkg_dir/bin" ]; then
+		for bin in "$pkg_dir/bin/"*; do
+			[ -e "$bin" ] || continue
+			name="${bin##*/}"
+			[ "$REMOVE_EXTENSION" = "true" ] && name="${name%%.*}"
+			echo "- $name"
+		done
+	else
+		find "$pkg_dir" -maxdepth 1 -mindepth 1 \( -perm -u+x -type f -o -type l \) |
+		while IFS= read -r bin; do
+			name="${bin##*/}"
+			[ "$REMOVE_EXTENSION" = "true" ] && name="${name%%.*}"
+			echo "- $name"
+		done
+	fi
+}
+
+# ============================================================
+# Public subcommands
+# ============================================================
+
+basher2_help_install() {
+	echo 'Summary: Installs a package from github (or a custom site)'
+	echo 'Usage: basher2 install [--ssh] [site/]<package>[@ref] [folder]'
+}
+basher2_install() {
+	local use_ssh="false"
+
+	case "${1:-}" in --ssh) use_ssh="true"; shift ;; esac
+
+	if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+		basher2_help
+		return 1
+	fi
+
+	local package site
+	case "$1" in
+		*/*/* )
+			site="${1%%/*}"
+			package="${1#*/}"
+			;;
+		*/* )
+			package="$1"
+			site="github.com"
+			;;
+		*)
+			echo >&2 "basher2: invalid package '$1' — expected [site/]user/name"
+			return 1
+			;;
+	esac
+
+	# Split off @ref suffix
+	local ref
+	case "$package" in
+		*@*)
+			ref="${package##*@}"
+			package="${package%%@*}"
+			;;
+		*)
+			ref=""
+			;;
+	esac
+
+	local user="${package%%/*}" name="${package#*/}"
+	if ! validate_pkg_component "$user" || ! validate_pkg_component "$name"; then
+		echo >&2 "basher2: invalid package name '$package'"
+		return 1
+	fi
+
+	local custom_folder="false" folder="$package"
+	if [ -n "${2:-}" ]; then
+		case "$2" in
+			*/*)
+				folder="$2"; custom_folder="true"
+			;;
+			*)
+				echo >&2 "basher2: [folder] must be in the format <namespace>/<name>"
+				return 1
+			;;
+		esac
+	fi
+
+	if [ "$custom_folder" = "true" ]; then
+		_clone "$use_ssh" "$site" "$package" "$ref" "$folder"
+	else
+		_clone "$use_ssh" "$site" "$package" "$ref" ""
+	fi
+	_deps "$folder"
+	_link "$folder"
+}
+
+basher2_help_uninstall() {
+	echo 'Summary: Uninstalls a package'
+	echo 'Usage: basher2 uninstall <package>'
+}
+# TAG completions
+basher2_uninstall() {
+	if [ "${1:-}" = "--complete" ]; then basher2_list; return 0; fi
+
+	if [ "$#" -ne 1 ]; then
+		basher2_help
+		return 1
+	fi
+
+	local package="$1"; shift
+	local user="${package%%/*}" name="${package#*/}"
+
+	if [ -z "$user" ] || [ "$user" = "$package" ] || [ -z "$name" ]; then
+		basher2_help
+		return 1
+	fi
+
+	if [ ! -d "$BASHER_PACKAGES_PATH/$package" ]; then
+		echo >&2 "basher2: package '$package' is not installed"
+		return 1
+	fi
+
+	# Guard against path traversal: ensure the resolved path stays under BASHER_PACKAGES_PATH
+	local target
+	target="$(resolve_path "$BASHER_PACKAGES_PATH/$package" 2>/dev/null)" \
+		|| target="$BASHER_PACKAGES_PATH/$package"
+	case "$target" in
+		"$BASHER_PACKAGES_PATH"/*) ;;
+		*)
+			echo >&2 "basher2: suspicious path '$BASHER_PACKAGES_PATH/$package' -> '$target', aborting"
+			return 1
+		;;
+	esac
+
+	_unlink "$package"
+	rm -rf "${BASHER_PACKAGES_PATH}/$package"
+}
+
+basher2_help_list() {
+	echo 'Summary: List installed packages'
+	echo 'Usage: basher2 list [-v]'
+}
+basher2_list() {
+	local verbose=""
+	case "${1:-}" in -v) verbose="true"; shift ;; esac
+
+	if [ "$#" -gt 0 ]; then
+		basher2_help
+		return 1
+	fi
+
+	for package_path in "$BASHER_PACKAGES_PATH"/*/*; do
+		[ -e "$package_path" ] || continue
+		local ns="${package_path%/*}"; ns="${ns##*/}"
+		local pkg="${package_path##*/}"
+		if [ -z "$verbose" ]; then
+			echo "$ns/$pkg"
+		else
+			local url
+			url="$(git --git-dir="$package_path/.git" config --get remote.origin.url 2>/dev/null \
+						 || echo 'local')"
+			printf "%-30s (%s)\n" "$ns/$pkg" "$url"
+			_list_bins "$ns/$pkg"
+		fi
+	done
+}
+
+basher2_help_upgrade() {
+	echo 'Summary: Upgrades a package to the latest version'
+	echo 'Usage: basher2 upgrade <package>'
+}
+# TAG completions
+basher2_upgrade() {
+	if [ "${1:-}" = "--complete" ]; then basher2_list; return 0; fi
+
+	if [ "${1:-}" = "--all" ]; then
+		basher2_outdated | while IFS= read -r package; do
+			echo "# $package"
+			basher2_upgrade "$package"
+		done
+		return 0
+	fi
+
+	if [ "$#" -ne 1 ]; then
+		basher2_help
+		return 1
+	fi
+
+	local package="$1"; shift
+	local user="${package%%/*}" name="${package#*/}"
+
+	if [ -z "$user" ] || [ "$user" = "$package" ] || [ -z "$name" ]; then
+		basher2_help
+		return 1
+	fi
+
+	(
+		cd "$BASHER_PACKAGES_PATH/$package"
+		_unlink "$package"
+		git pull
+		_link "$package"
+	)
+}
+
+basher2_help_link() {
+	echo 'Summary: Installs a local directory as a basher2 package'
+	echo 'Usage: basher2 link [--no-deps] <directory> <package>'
+}
+basher2_link() {
+	local no_deps="false"
+	case "${1:-}" in
+		(--no-deps) no_deps="true"; shift ;; #FIXME: shift quand $# -eq 0 ferait une erreur
+	esac
+
+	if [ "$#" -ne 2 ]; then
+		basher2_help
+		return 1
+	fi
+
+	local directory="$1" package="$2"; shift 2
+	local namespace="${package%%/*}" name="${package#*/}"
+
+	if [ ! -d "$directory" ]; then
+		echo >&2 "basher2: directory '$directory' not found"
+		return 1
+	fi
+	if [ -z "$namespace" ] || [ "$namespace" = "$package" ]; then
+		echo >&2 "basher2: missing <namespace> in '$package'"
+		return 1
+	fi
+	if [ -z "$name" ]; then
+		echo >&2 "basher2: missing <name> in '$package'"
+		return 1
+	fi
+	if [ -d "$BASHER_PACKAGES_PATH/$package" ]; then
+		echo >&2 "basher2: package '$package' is already present"
+		return 1
+	fi
+
+	directory="$(resolve_path "$directory")"
+	mkdir -p "$BASHER_PACKAGES_PATH/$namespace"
+	ln -s "$directory" "$BASHER_PACKAGES_PATH/$package"
+	_link "$package"
+
+	if [ "$no_deps" = "false" ]; then
+		_deps "$package"
+	fi
+}
+
+basher2_help_outdated() {
+	echo 'Summary: Displays a list of outdated packages'
+	echo 'Usage: basher2 outdated'
+}
+basher2_outdated() {
+	for package_path in "$BASHER_PACKAGES_PATH"/*/*; do
+		[ -e "$package_path" ] || continue
+		[ ! -L "$package_path" ] || continue
+		local ns="${package_path%/*}"; ns="${ns##*/}"
+		local pkgname="${package_path##*/}"
+		(
+			cd "$package_path"
+			git remote update > /dev/null 2>&1
+			if git symbolic-ref --short -q HEAD > /dev/null 2>&1; then
+				if [ "$(git rev-list --count HEAD...HEAD@{upstream} 2>/dev/null || echo 0)" -gt 0 ]; then
+					echo "$ns/$pkgname"
+				fi
+			fi
+		)
+	done
+}
+
+basher_help_init() {
+	echo 'Summary: Configure the shell environment for basher2'
+	echo 'Usage: basher2 init - <shell>'
+}
+basher2_init() {
+	local shell="${2:-}"
+	if [ -z "$shell" ]; then
+		printf 'Usage: eval "$(basher2 init - bash)"\n' >&2; return 1
+	fi
+
+	echo "export BASHER_SHELL=$shell"
+	echo "export BASHER_ROOT=$BASHER_ROOT"
+	echo "export BASHER_PREFIX=$BASHER_PREFIX"
+	echo "export BASHER_PACKAGES_PATH=$BASHER_PACKAGES_PATH"
+	echo "export BASHER_INSTALL_BIN=$BASHER_INSTALL_BIN"
+	echo "export BASHER_INSTALL_MAN=$BASHER_INSTALL_MAN"
+	echo 'if [ "${PATH#*$BASHER_INSTALL_BIN}" = "${PATH}" ]; then'
+	echo '	export PATH="$BASHER_INSTALL_BIN:$PATH"'
+	echo 'fi'
+
+	if [ -e "$BASHER2_ROOT/lib/include.sh" ]; then
+		echo ". \"$BASHER2_ROOT/lib/include.sh\""
+	fi
+
+	if [ "$shell" = "bash" ]; then
+		if [ -e "$BASHER2_ROOT/completions/basher2.bash" ]; then
+			echo ". \"$BASHER2_ROOT/completions/basher2.bash\""
+		fi
+		echo 'for _f in "$BASHER_PREFIX/completions/bash/"*; do [ -f "$_f" ] && . "$_f"; done'
+		echo 'unset _f'
+	fi
+}
+
+basher2_help_help() {
+	echo 'Summary: Display help for a command'
+	echo 'Usage: basher2 help [COMMAND]'
+}
+# TAG completions
+basher2_help() {
+	if [ "${1:-}" = "--complete" ]; then basher2_commands; return 0; fi
+
+	# $cmd is available as upvalue from the basher2() dispatcher
+	local target="${1:-${cmd:-}}"
+
+	if [ -z "$target" ] || [ "$target" = "basher2" ]; then
+		echo "Usage: basher2 <command> [<args>]"
+		echo
+		echo "Commands:"
+		basher2_commands
+		return 0
+	fi
+
+	# Convert package-path → package_path for function lookup
+	local fn_target
+	case "$target" in
+		(package-path) fn_target=package_path ;;
+		(*) fn_target="$target" ;;
+	esac
+
+	if ! command -v "basher2_help_${fn_target}" >/dev/null 2>&1; then
+		echo >&2 "basher2: no such command '$target'"
+		return 1
+	fi
+	"basher2_help_${fn_target}"
+}
+
+basher2_help_commands() {
+	echo 'Summary: List all available basher2 commands'
+	echo 'Usage: basher2 commands'
+}
+basher2_commands() {
+	printf '%s\n' install uninstall list upgrade link outdated init help commands completions package-path
+}
+
+basher2_help_completions() {
+	echo 'Summary: List completions for a command'
+	echo 'Usage: basher2 completions <command>'
+}
+basher2_completions() {
+	local cmd="${1:-}"
+	if [ -z "$cmd" ]; then
+		basher2_help
+		return 1
+	fi
+
+	local func="basher2_$cmd"
+	case "$cmd" in (package-path) func="basher2_package_path" ;; esac
+
+	case "$func" in
+		basher2_uninstall|basher2_upgrade|basher2_help|basher2_package_path)
+			"$func" --complete
+		;;
+	esac
+}
+
+basher2_help_package_path() {
+	echo 'Summary: Outputs the path for a package'
+	echo 'Usage: basher2 package-path <package>'
+}
+# TAG completions
+basher2_package_path() {
+	if [ "${1:-}" = "--complete" ]; then basher2_list; return 0; fi
+	if [ "$#" -ne 1 ]; then
+		basher2_help
+		return 1
+	fi
+	echo "$BASHER_PACKAGES_PATH/$1"
+}
+
+# ============================================================
+# Dispatcher
+# ============================================================
+
+basher2() {
+	if [ $# -eq 0 ] || [ -z "$1" ]; then
+		set -- help
+	fi
+	local cmd="$1";shift
+	case "$cmd" in
+		(package-path) cmd=package_path ;;
+	esac
+	if command -v "basher2_${cmd}" >/dev/null 2>&1; then
+		"basher2_${cmd}" "$@"
+	else
+		basher2_help >&2
+		return 127
+	fi
+}
+
+basher2 "$@"
